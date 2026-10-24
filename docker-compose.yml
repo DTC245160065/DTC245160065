@@ -1,0 +1,179 @@
+services:
+  # 1. Cơ sở dữ liệu MySQL (Cô lập hoàn toàn trong backend_net)
+  db:
+    image: mysql:8.0
+    container_name: mysql_db
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - backend_net
+    security_opt:
+      - no-new-privileges:true
+
+  # 2. Website WordPress
+  wordpress:
+    image: wordpress:latest
+    container_name: wordpress_app
+    depends_on:
+      - db
+    restart: unless-stopped
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: ${MYSQL_USER}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE}
+    volumes:
+      - wp_data:/var/www/html
+    networks:
+      - frontend_net
+      - backend_net
+    security_opt:
+      - no-new-privileges:true
+
+  # 3. Quản trị CSDL phpMyAdmin
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: phpmyadmin
+    depends_on:
+      - db
+    restart: unless-stopped
+    environment:
+      PMA_HOST: db
+    networks:
+      - frontend_net
+      - backend_net
+    security_opt:
+      - no-new-privileges:true
+
+  # 4. Nginx Reverse Proxy (Chỉ nằm ở frontend_net, không chạm trực tiếp vào DB)
+  nginx:
+    image: nginx:alpine
+    container_name: nginx_proxy
+    depends_on:
+      - wordpress
+      - phpmyadmin
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - frontend_net
+    security_opt:
+      - no-new-privileges:true
+
+  # 5. Prometheus & Bộ 4 Exporters (Host, Container, Web, DB)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    user: "65534:65534" # Hardening: Chạy dưới quyền non-root (nobody)
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring_net
+    security_opt:
+      - no-new-privileges:true
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    user: "65534:65534" # Non-root container
+    restart: unless-stopped
+    networks:
+      - monitoring_net
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - monitoring_net
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:latest
+    container_name: nginx_exporter
+    user: "65534:65534" # Non-root container
+    restart: unless-stopped
+    command:
+      - -nginx.scrape-uri=http://nginx:80/stub_status
+    depends_on:
+      - nginx
+    networks:
+      - frontend_net
+      - monitoring_net
+
+  mysql-exporter:
+    image: prom/mysqld-exporter:v0.14.0
+    container_name: mysql_exporter
+    user: "65534:65534" # Non-root container
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "${MYSQL_USER}:${MYSQL_PASSWORD}@(db:3306)/"
+    depends_on:
+      - db
+    networks:
+      - backend_net
+      - monitoring_net
+
+  # 6. Loki + Promtail (Quản lý Log tập trung)
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring_net
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - monitoring_net
+
+  # 7. Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    user: "472:472" # Non-root user mặc định của Grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    networks:
+      - monitoring_net
+
+volumes:
+  db_data:
+  wp_data:
+
+# Hardening: Network Isolation (Cô lập mạng thành 3 phân vùng)
+networks:
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge
+    internal: true # Cô lập hoàn toàn DB với mạng ngoài
+  monitoring_net:
+    driver: bridge
